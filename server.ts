@@ -1,16 +1,30 @@
 import express from "express";
 import path from "path";
+import fs from "fs";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
 import * as dotenv from "dotenv";
 
 dotenv.config({ override: true });
 
+function getGeminiApiKey(): string | undefined {
+  const key = process.env.GEMINI_API_KEY || process.env.API_KEY || process.env.GOOGLE_API_KEY;
+  if (!key) return undefined;
+  const cleaned = key.replace(/["']/g, "").trim();
+  if (!cleaned || cleaned === "MY_GEMINI_API_KEY") return undefined;
+  return cleaned;
+}
+
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function generateContentWithRetry(ai: GoogleGenAI, config: any) {
   // Use high-capacity, low-latency models with automatic fallback & backoff
-  const candidateModels = ["gemini-flash-latest", "gemini-3.1-flash-lite", "gemini-3.8-flash"];
+  const candidateModels = [
+    "gemini-2.5-flash",
+    "gemini-3.8-flash",
+    "gemini-flash-latest",
+    "gemini-3.1-flash-lite"
+  ];
   let lastError: any = null;
 
   for (const model of candidateModels) {
@@ -46,10 +60,22 @@ async function generateContentWithRetry(ai: GoogleGenAI, config: any) {
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT) || 3000;
 
   app.use(express.json({ limit: "50mb" }));
   app.use(express.urlencoded({ extended: true, limit: "50mb" }));
+
+  // Health check endpoint for deployment monitoring
+  app.get("/api/health", (req, res) => {
+    const hasKey = !!getGeminiApiKey();
+    res.json({
+      status: "ok",
+      apiKeyConfigured: hasKey,
+      env: process.env.NODE_ENV || "production",
+      port: PORT,
+      timestamp: new Date().toISOString()
+    });
+  });
 
   // API Routes
   app.post("/api/extract-pdf", async (req, res) => {
@@ -59,7 +85,12 @@ async function startServer() {
         return res.status(400).json({ error: "Data file PDF tidak ditemukan." });
       }
 
-      const pdfBuffer = Buffer.from(base64, "base64");
+      let cleanBase64 = base64;
+      if (cleanBase64.includes(",")) {
+        cleanBase64 = cleanBase64.split(",")[1];
+      }
+
+      const pdfBuffer = Buffer.from(cleanBase64, "base64");
       let extractedText = "";
       let numPages = 1;
       let method = "pdf-parse";
@@ -69,7 +100,10 @@ async function startServer() {
         const { PDFParse } = await import("pdf-parse");
         const parser = new PDFParse({ data: pdfBuffer });
         const result = await parser.getText();
-        extractedText = (result.text || "").trim();
+        let raw = (result.text || "").trim();
+        // Remove pdf-parse page marker tags like "-- 1 of 2 --"
+        raw = raw.replace(/--\s*\d+\s+of\s+\d+\s*--/g, "").trim();
+        extractedText = raw;
         numPages = result.total || 1;
         await parser.destroy().catch(() => {});
       } catch (parseErr: any) {
@@ -78,8 +112,8 @@ async function startServer() {
 
       // 2. If text is too short or empty (e.g. scanned image PDF), fallback to Gemini Multimodal
       if (extractedText.length < 40) {
-        const apiKey = process.env.GEMINI_API_KEY;
-        if (apiKey && apiKey !== "MY_GEMINI_API_KEY") {
+        const apiKey = getGeminiApiKey();
+        if (apiKey) {
           try {
             const ai = new GoogleGenAI({
               apiKey,
@@ -95,7 +129,7 @@ async function startServer() {
               contents: [
                 {
                   inlineData: {
-                    data: base64,
+                    data: cleanBase64,
                     mimeType: "application/pdf"
                   }
                 },
@@ -118,7 +152,7 @@ async function startServer() {
 
       if (!extractedText || extractedText.length < 10) {
         return res.status(422).json({
-          error: "Tidak dapat mengekstrak teks dari berkas PDF ini. Pastikan PDF memuat teks tulisan argumentatif yang terbaca dan tidak rusak."
+          error: "Tidak dapat membaca teks tulisan dari dokumen PDF ini. Pastikan berkas PDF memuat teks yang dapat dibaca atau silakan salin-tempel teks secara langsung ke editor."
         });
       }
 
@@ -141,10 +175,10 @@ async function startServer() {
   app.post("/api/analyze", async (req, res) => {
     try {
       const { text } = req.body;
-      const apiKey = process.env.GEMINI_API_KEY;
+      const apiKey = getGeminiApiKey();
       
-      if (!apiKey || apiKey === "MY_GEMINI_API_KEY") {
-        return res.status(401).json({ error: "Gemini API Key belum dikonfigurasi atau tidak valid. Silakan atur API Key Anda di menu Pengaturan/Secrets AI Studio." });
+      if (!apiKey) {
+        return res.status(401).json({ error: "Gemini API Key belum dikonfigurasi pada server. Pastikan API Key telah tersedia pada environment variable GEMINI_API_KEY." });
       }
 
       const ai = new GoogleGenAI({
@@ -229,8 +263,29 @@ async function startServer() {
         }
       });
 
-      const cleanText = (response.text || '{}').replace(/```json|```/g, '').trim();
-      const result = JSON.parse(cleanText);
+      let cleanText = (response.text || "{}").trim();
+      if (cleanText.includes("```")) {
+        const match = cleanText.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+        if (match && match[1]) {
+          cleanText = match[1].trim();
+        } else {
+          cleanText = cleanText.replace(/```json|```/g, "").trim();
+        }
+      }
+
+      let result;
+      try {
+        result = JSON.parse(cleanText);
+      } catch (parseError) {
+        const firstBrace = cleanText.indexOf('{');
+        const lastBrace = cleanText.lastIndexOf('}');
+        if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+          result = JSON.parse(cleanText.substring(firstBrace, lastBrace + 1));
+        } else {
+          throw parseError;
+        }
+      }
+
       res.json(result);
     } catch (error: any) {
       console.error("Analysis failed:", error);
@@ -247,10 +302,10 @@ async function startServer() {
   app.post("/api/chat", async (req, res) => {
     try {
       const { text, userMsg, chatHistory } = req.body;
-      const apiKey = process.env.GEMINI_API_KEY;
+      const apiKey = getGeminiApiKey();
       
-      if (!apiKey || apiKey === "MY_GEMINI_API_KEY") {
-        return res.status(401).json({ error: "Gemini API Key belum dikonfigurasi. Silakan atur API Key Anda di menu Pengaturan/Secrets AI Studio." });
+      if (!apiKey) {
+        return res.status(401).json({ error: "Gemini API Key belum dikonfigurasi pada server. Silakan atur API Key Anda di menu Secrets AI Studio." });
       }
 
       const ai = new GoogleGenAI({
@@ -320,19 +375,22 @@ async function startServer() {
     }
   });
 
-  // Vite middleware for development
-  if (process.env.NODE_ENV !== "production") {
+  // Serve static assets in production, or Vite dev server in development
+  const isDev = process.env.NODE_ENV === "development";
+  const distPath = path.join(process.cwd(), 'dist');
+  const distExists = fs.existsSync(path.join(distPath, 'index.html'));
+
+  if (!isDev && distExists) {
+    app.use(express.static(distPath));
+    app.get('*', (req, res) => {
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
+  } else {
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: "spa",
     });
     app.use(vite.middlewares);
-  } else {
-    const distPath = path.join(process.cwd(), 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
   }
 
   app.listen(PORT, "0.0.0.0", () => {

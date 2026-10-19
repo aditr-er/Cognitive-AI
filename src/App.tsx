@@ -218,6 +218,39 @@ export default function App() {
     }
   };
 
+  // Client-side text stream fallback in case server extraction fails
+  const extractTextFromPdfClientFallback = async (file: File): Promise<string> => {
+    try {
+      const buffer = await file.arrayBuffer();
+      const textDecoder = new TextDecoder('latin1');
+      const content = textDecoder.decode(buffer);
+      
+      const streamRegex = /BT[\s\S]*?ET/g;
+      const matches = content.match(streamRegex);
+      if (!matches || matches.length === 0) return '';
+      
+      const textPieces: string[] = [];
+      for (const block of matches) {
+        const tjRegex = /\(([^)]+)\)\s*(?:Tj|'|")/g;
+        let m;
+        while ((m = tjRegex.exec(block)) !== null) {
+          if (m[1]) textPieces.push(m[1]);
+        }
+        const arrayRegex = /\[([^\]]+)\]\s*TJ/g;
+        while ((m = arrayRegex.exec(block)) !== null) {
+          const innerRegex = /\(([^)]+)\)/g;
+          let im;
+          while ((im = innerRegex.exec(m[1])) !== null) {
+            if (im[1]) textPieces.push(im[1]);
+          }
+        }
+      }
+      return textPieces.join(' ').replace(/\\([()\\])/g, '$1').replace(/\s+/g, ' ').trim();
+    } catch {
+      return '';
+    }
+  };
+
   // PDF Upload Handlers
   const handlePdfFile = async (file: File, autoAnalyze = autoAnalyzeAfterUpload) => {
     if (!file) return;
@@ -249,22 +282,37 @@ export default function App() {
 
       setPdfExtractionProgress("Mengekstrak teks argumentatif dari PDF...");
 
-      const res = await fetch('/api/extract-pdf', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          base64,
-          filename: file.name
-        })
-      });
+      let extractedText = "";
+      let numPages = 1;
 
-      if (!res.ok) {
-        const errJson = await res.json().catch(() => ({}));
-        throw new Error(errJson.error || 'Gagal mengekstrak teks dari PDF.');
+      try {
+        const res = await fetch('/api/extract-pdf', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            base64,
+            filename: file.name
+          })
+        });
+
+        if (!res.ok) {
+          const errJson = await res.json().catch(() => ({}));
+          throw new Error(errJson.error || `Gagal mengekstrak teks dari server (Status ${res.status}).`);
+        }
+
+        const data = await res.json();
+        extractedText = (data.text || '').trim();
+        numPages = data.numPages || 1;
+      } catch (serverErr: any) {
+        console.warn("Server PDF extraction failed, trying client fallback:", serverErr);
+        const fallbackText = await extractTextFromPdfClientFallback(file);
+        if (fallbackText && fallbackText.length > 20) {
+          extractedText = fallbackText;
+          showToast("Teks berhasil diekstrak via pembaca lokal peramban.", "info");
+        } else {
+          throw serverErr;
+        }
       }
-
-      const data = await res.json();
-      const extractedText = (data.text || '').trim();
 
       const sizeKB = Math.round(file.size / 1024);
       const sizeFormatted = sizeKB > 1024 ? `${(sizeKB / 1024).toFixed(1)} MB` : `${sizeKB} KB`;
@@ -272,8 +320,8 @@ export default function App() {
       const pdfData: UploadedPdfInfo = {
         filename: file.name,
         sizeFormatted,
-        numPages: data.numPages || 1,
-        wordCount: data.wordCount || extractedText.split(/\s+/).filter(Boolean).length,
+        numPages: numPages || 1,
+        wordCount: extractedText.split(/\s+/).filter(Boolean).length,
         extractedText,
         uploadedAt: Date.now()
       };
