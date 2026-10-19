@@ -1,0 +1,6 @@
+{
+  "name": "Cognitive AI Scaffolding Workspace",
+  "description": "A personalized AI assistant for argumentative writing using Vygotskian scaffolding principles.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
