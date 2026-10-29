@@ -32,14 +32,16 @@ export interface ChatMessage {
   text: string;
 }
 
-export interface UploadedPdfInfo {
+export interface UploadedDocumentInfo {
   filename: string;
+  fileType: 'pdf' | 'docx' | 'doc';
   sizeFormatted: string;
   numPages: number;
   wordCount: number;
   extractedText: string;
   uploadedAt: number;
 }
+export type UploadedPdfInfo = UploadedDocumentInfo;
 
 export interface HallidayIdeational {
   score: number;
@@ -90,6 +92,7 @@ export interface AnalysisResult {
   counterArgument: { score: number; status: string; feedback: string };
   generalFeedback: string;
   halliday?: HallidayAnalysis;
+  sourceDoc?: { filename: string; numPages: number; fileType: 'pdf' | 'docx' | 'doc' };
   sourcePdf?: { filename: string; numPages: number };
 }
 
@@ -104,7 +107,7 @@ export default function App() {
   const [text, setText] = useState('');
   const [wordCount, setWordCount] = useState(0);
   const [chatHistory, setChatHistory] = useState<ChatMessage[]>([
-    { role: 'ai', text: 'Halo! Saya asisten scaffolding Anda. Mari kita mulai menyusun argumen yang logis dan persuasif. Anda dapat mengetik langsung atau mengunggah dokumen PDF berisi teks argumentatif.' }
+    { role: 'ai', text: 'Halo! Saya asisten scaffolding Anda. Mari kita mulai menyusun argumen yang logis dan persuasif. Anda dapat mengetik langsung atau mengunggah dokumen PDF maupun Word (DOCX/DOC) berisi teks argumentatif.' }
   ]);
   const [chatInput, setChatInput] = useState('');
   const [isAnalyzing, setIsAnalyzing] = useState(false);
@@ -154,7 +157,7 @@ export default function App() {
   }, [chatHistory]);
 
   // Handlers
-  const handleAnalyze = async (overrideText?: string, pdfMeta?: { filename: string; numPages: number }) => {
+  const handleAnalyze = async (overrideText?: string, docMeta?: { filename: string; numPages: number; fileType?: 'pdf' | 'docx' | 'doc' }) => {
     const textToAnalyze = overrideText !== undefined ? overrideText : text;
     if (textToAnalyze.trim().length < 20) {
       showToast("Teks terlalu singkat. Mohon tulis atau unggah argumen minimal 20 karakter untuk dianalisis.", "info");
@@ -178,9 +181,19 @@ export default function App() {
       }
 
       const result = await response.json() as AnalysisResult;
-      const currentPdf = pdfMeta || (uploadedPdf ? { filename: uploadedPdf.filename, numPages: uploadedPdf.numPages } : undefined);
-      if (currentPdf) {
-        result.sourcePdf = currentPdf;
+      const currentDoc = docMeta || (uploadedPdf ? { 
+        filename: uploadedPdf.filename, 
+        numPages: uploadedPdf.numPages,
+        fileType: uploadedPdf.fileType || 'pdf'
+      } : undefined);
+      
+      if (currentDoc) {
+        result.sourceDoc = {
+          filename: currentDoc.filename,
+          numPages: currentDoc.numPages,
+          fileType: currentDoc.fileType || 'pdf'
+        };
+        result.sourcePdf = { filename: currentDoc.filename, numPages: currentDoc.numPages };
       }
 
       setAnalysis(result);
@@ -199,7 +212,8 @@ export default function App() {
       const hallidayHighlight = result.halliday 
         ? ` Evaluasi Halliday: ${result.halliday.sflSummary}` 
         : '';
-      const sourceNote = currentPdf ? ` (Dokumen PDF: **${currentPdf.filename}**)` : '';
+      const docTypeLabel = currentDoc?.fileType ? currentDoc.fileType.toUpperCase() : 'Dokumen';
+      const sourceNote = currentDoc ? ` (Dokumen ${docTypeLabel}: **${currentDoc.filename}**)` : '';
 
       setChatHistory(prev => [...prev, { 
         role: 'ai', 
@@ -251,21 +265,30 @@ export default function App() {
     }
   };
 
-  // PDF Upload Handlers
-  const handlePdfFile = async (file: File, autoAnalyze = autoAnalyzeAfterUpload) => {
+  // Document (PDF & Word DOCX/DOC) Upload Handlers
+  const handleDocumentFile = async (file: File, autoAnalyze = autoAnalyzeAfterUpload) => {
     if (!file) return;
-    if (!file.name.toLowerCase().endsWith('.pdf') && file.type !== 'application/pdf') {
-      showToast("Format file tidak didukung. Mohon unggah dokumen PDF (.pdf).", "error");
+
+    const lowerName = file.name.toLowerCase();
+    const isPdf = lowerName.endsWith('.pdf') || file.type === 'application/pdf';
+    const isDocx = lowerName.endsWith('.docx') || file.type === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+    const isDoc = lowerName.endsWith('.doc') || file.type === 'application/msword';
+
+    if (!isPdf && !isDocx && !isDoc) {
+      showToast("Format file tidak didukung. Mohon unggah berkas PDF (.pdf) atau Word (.docx / .doc).", "error");
       return;
     }
     if (file.size > 25 * 1024 * 1024) {
-      showToast("Ukuran dokumen PDF melebihi batas 25MB.", "error");
+      showToast("Ukuran dokumen melebihi batas 25MB.", "error");
       return;
     }
 
+    const detectedType: 'pdf' | 'docx' | 'doc' = isDocx ? 'docx' : isDoc ? 'doc' : 'pdf';
+    const typeLabel = detectedType === 'docx' ? 'Word (.docx)' : detectedType === 'doc' ? 'Word (.doc)' : 'PDF';
+
     setIsExtractingPdf(true);
     setPdfError(null);
-    setPdfExtractionProgress(`Membaca dokumen ${file.name}...`);
+    setPdfExtractionProgress(`Membaca dokumen ${typeLabel} "${file.name}"...`);
 
     try {
       const reader = new FileReader();
@@ -280,13 +303,14 @@ export default function App() {
       reader.readAsDataURL(file);
       const base64 = await base64Promise;
 
-      setPdfExtractionProgress("Mengekstrak teks argumentatif dari PDF...");
+      setPdfExtractionProgress(`Mengekstrak teks argumentasi dari berkas ${typeLabel}...`);
 
       let extractedText = "";
       let numPages = 1;
+      let finalFileType = detectedType;
 
       try {
-        const res = await fetch('/api/extract-pdf', {
+        const res = await fetch('/api/extract-document', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -303,12 +327,17 @@ export default function App() {
         const data = await res.json();
         extractedText = (data.text || '').trim();
         numPages = data.numPages || 1;
+        if (data.fileType) finalFileType = data.fileType;
       } catch (serverErr: any) {
-        console.warn("Server PDF extraction failed, trying client fallback:", serverErr);
-        const fallbackText = await extractTextFromPdfClientFallback(file);
-        if (fallbackText && fallbackText.length > 20) {
-          extractedText = fallbackText;
-          showToast("Teks berhasil diekstrak via pembaca lokal peramban.", "info");
+        console.warn("Server document extraction failed, evaluating fallback:", serverErr);
+        if (isPdf) {
+          const fallbackText = await extractTextFromPdfClientFallback(file);
+          if (fallbackText && fallbackText.length > 20) {
+            extractedText = fallbackText;
+            showToast("Teks PDF berhasil diekstrak via pembaca lokal peramban.", "info");
+          } else {
+            throw serverErr;
+          }
         } else {
           throw serverErr;
         }
@@ -317,8 +346,9 @@ export default function App() {
       const sizeKB = Math.round(file.size / 1024);
       const sizeFormatted = sizeKB > 1024 ? `${(sizeKB / 1024).toFixed(1)} MB` : `${sizeKB} KB`;
 
-      const pdfData: UploadedPdfInfo = {
+      const docData: UploadedDocumentInfo = {
         filename: file.name,
+        fileType: finalFileType,
         sizeFormatted,
         numPages: numPages || 1,
         wordCount: extractedText.split(/\s+/).filter(Boolean).length,
@@ -328,14 +358,14 @@ export default function App() {
 
       // Check if text already exists in editor
       if (text.trim().length > 30) {
-        setPendingPdf(pdfData);
+        setPendingPdf(docData);
         setShowPdfReplaceModal(true);
       } else {
-        applyPdfContent(pdfData, 'replace', autoAnalyze);
+        applyPdfContent(docData, 'replace', autoAnalyze);
       }
     } catch (err: any) {
-      console.error("PDF extraction error:", err);
-      const msg = err.message || "Gagal memproses file PDF.";
+      console.error("Document extraction error:", err);
+      const msg = err.message || `Gagal memproses berkas ${typeLabel}.`;
       setPdfError(msg);
       showToast(msg, "error");
     } finally {
@@ -347,26 +377,34 @@ export default function App() {
     }
   };
 
-  const applyPdfContent = (pdfData: UploadedPdfInfo, mode: 'replace' | 'append', shouldAnalyze: boolean) => {
+  // Backwards compatible alias
+  const handlePdfFile = handleDocumentFile;
+
+  const applyPdfContent = (docData: UploadedDocumentInfo, mode: 'replace' | 'append', shouldAnalyze: boolean) => {
     const nextText = mode === 'replace' 
-      ? pdfData.extractedText 
-      : `${text.trim()}\n\n---\n\n${pdfData.extractedText}`;
+      ? docData.extractedText 
+      : `${text.trim()}\n\n---\n\n${docData.extractedText}`;
     
     setText(nextText);
-    setUploadedPdf(pdfData);
+    setUploadedPdf(docData);
     setShowPdfReplaceModal(false);
     setPendingPdf(null);
 
-    showToast(`Dokumen "${pdfData.filename}" berhasil dimuat (${pdfData.wordCount} kata, ${pdfData.numPages} hal).`, 'success');
+    const formatBadge = docData.fileType.toUpperCase();
+    showToast(`Dokumen ${formatBadge} "${docData.filename}" berhasil dimuat (${docData.wordCount} kata, ${docData.numPages} hal).`, 'success');
 
     if (shouldAnalyze) {
-      handleAnalyze(nextText, { filename: pdfData.filename, numPages: pdfData.numPages });
+      handleAnalyze(nextText, { 
+        filename: docData.filename, 
+        numPages: docData.numPages,
+        fileType: docData.fileType
+      });
     }
   };
 
   const handleRemovePdf = () => {
     setUploadedPdf(null);
-    showToast("Berkas PDF dilepas dari sesi editor.", "info");
+    showToast("Berkas dokumen dilepas dari sesi editor.", "info");
   };
 
   // Drag and Drop handlers
@@ -548,8 +586,10 @@ export default function App() {
     if ('timestamp' in item) {
       report += `Waktu: ${new Date(item.timestamp).toLocaleString()}\n`;
     }
-    if (item.sourcePdf) {
-      report += `Dokumen Sumber PDF: ${item.sourcePdf.filename} (${item.sourcePdf.numPages} Halaman)\n`;
+    if (item.sourceDoc) {
+      report += `Dokumen Sumber: ${item.sourceDoc.filename} (${item.sourceDoc.fileType.toUpperCase()}, ${item.sourceDoc.numPages} Halaman)\n`;
+    } else if (item.sourcePdf) {
+      report += `Dokumen Sumber: ${item.sourcePdf.filename} (${item.sourcePdf.numPages} Halaman)\n`;
     }
 
     const comp = calculateCompositeScore(item, weightRatio);
@@ -714,15 +754,15 @@ export default function App() {
             onDrop={handleDrop}
             className="relative bg-panel rounded-lg border border-border flex flex-col p-4 shadow-sm min-h-[320px] transition-all"
           >
-            {/* Hidden File Input for PDF */}
+            {/* Hidden File Input for PDF and Word */}
             <input 
               ref={fileInputRef}
               type="file" 
-              accept=".pdf,application/pdf"
+              accept=".pdf,.docx,.doc,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/msword"
               className="hidden" 
               onChange={(e) => {
                 const file = e.target.files?.[0];
-                if (file) handlePdfFile(file);
+                if (file) handleDocumentFile(file);
               }}
             />
 
@@ -731,8 +771,8 @@ export default function App() {
               <div className="absolute inset-0 bg-blue-600/15 backdrop-blur-[2px] border-2 border-dashed border-primary rounded-lg z-30 flex flex-col items-center justify-center pointer-events-none p-4">
                 <div className="bg-white px-6 py-5 rounded-2xl shadow-2xl flex flex-col items-center gap-2 border border-blue-100 text-center animate-scaleUp">
                   <FileUp className="w-12 h-12 text-primary animate-bounce" />
-                  <p className="font-bold text-slate-800 text-base">Lepaskan Berkas PDF di Sini</p>
-                  <p className="text-xs text-slate-500 max-w-xs">Teks argumentatif dalam dokumen PDF akan diekstrak secara otomatis untuk dinilai.</p>
+                  <p className="font-bold text-slate-800 text-base">Lepaskan Berkas PDF atau Word di Sini</p>
+                  <p className="text-xs text-slate-500 max-w-xs">Teks argumentatif dalam dokumen PDF (.pdf) atau Microsoft Word (.docx, .doc) akan diekstrak secara otomatis untuk dinilai.</p>
                 </div>
               </div>
             )}
@@ -749,22 +789,22 @@ export default function App() {
                   onClick={() => fileInputRef.current?.click()}
                   disabled={isExtractingPdf}
                   className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-blue-50 hover:bg-blue-100 text-primary border border-blue-200 rounded-md text-xs font-semibold transition-all shadow-2xs disabled:opacity-50 cursor-pointer"
-                  title="Unggah berkas PDF berisi teks argumentatif"
+                  title="Unggah berkas PDF atau Word (.docx / .doc) berisi teks argumentatif"
                 >
                   <Upload className="w-3.5 h-3.5" />
-                  <span>Unggah PDF</span>
+                  <span>Unggah PDF / Word</span>
                 </button>
               </div>
             </div>
 
-            {/* PDF Extraction Progress State */}
+            {/* Document Extraction Progress State */}
             {isExtractingPdf && (
               <div className="mb-3 p-3.5 bg-blue-50/90 border border-blue-200 rounded-lg flex items-center justify-between gap-3 animate-pulse">
                 <div className="flex items-center gap-3">
                   <Loader2 className="w-5 h-5 text-primary animate-spin shrink-0" />
                   <div>
-                    <p className="text-sm font-semibold text-blue-900">{pdfExtractionProgress || "Mengekstrak teks argumentatif dari PDF..."}</p>
-                    <p className="text-xs text-blue-700">Membaca halaman, klausa kalimat, dan struktur alinea dokumen.</p>
+                    <p className="text-sm font-semibold text-blue-900">{pdfExtractionProgress || "Mengekstrak teks argumentatif dari dokumen..."}</p>
+                    <p className="text-xs text-blue-700">Membaca paragraf, klausa kalimat, dan susunan wacana dokumen.</p>
                   </div>
                 </div>
                 <span className="text-xs font-mono font-medium text-blue-700 bg-white px-2.5 py-1 rounded-md border border-blue-200 shadow-2xs">
@@ -773,13 +813,13 @@ export default function App() {
               </div>
             )}
 
-            {/* PDF Error State */}
+            {/* Document Error State */}
             {pdfError && (
               <div className="mb-3 p-3 bg-red-50 border border-red-200 rounded-lg flex items-start justify-between gap-3">
                 <div className="flex items-start gap-2.5">
                   <AlertCircle className="w-5 h-5 text-red-500 shrink-0 mt-0.5" />
                   <div>
-                    <p className="text-sm font-semibold text-red-900">Gagal Membaca Dokumen PDF</p>
+                    <p className="text-sm font-semibold text-red-900">Gagal Membaca Dokumen PDF / Word</p>
                     <p className="text-xs text-red-700 mt-0.5">{pdfError}</p>
                   </div>
                 </div>
@@ -800,14 +840,20 @@ export default function App() {
               </div>
             )}
 
-            {/* Active Uploaded PDF Document Banner */}
+            {/* Active Uploaded Document Banner (PDF or Word) */}
             {uploadedPdf && !isExtractingPdf && (
               <div className="mb-3 p-3.5 bg-gradient-to-r from-blue-50/80 via-slate-50 to-indigo-50/60 border border-blue-200 rounded-lg shadow-2xs">
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                   <div className="flex items-start sm:items-center gap-3">
-                    <div className="w-10 h-10 rounded-lg bg-red-50 text-red-600 border border-red-200 flex items-center justify-center shrink-0 shadow-2xs font-bold text-xs tracking-wider">
-                      PDF
-                    </div>
+                    {uploadedPdf.fileType === 'docx' || uploadedPdf.fileType === 'doc' ? (
+                      <div className="w-10 h-10 rounded-lg bg-blue-600 text-white flex items-center justify-center shrink-0 shadow-2xs font-bold text-xs tracking-wider">
+                        {uploadedPdf.fileType.toUpperCase()}
+                      </div>
+                    ) : (
+                      <div className="w-10 h-10 rounded-lg bg-red-50 text-red-600 border border-red-200 flex items-center justify-center shrink-0 shadow-2xs font-bold text-xs tracking-wider">
+                        PDF
+                      </div>
+                    )}
                     <div>
                       <div className="flex items-center gap-2 flex-wrap">
                         <span className="font-semibold text-sm text-slate-800 max-w-[240px] sm:max-w-[340px] truncate" title={uploadedPdf.filename}>
@@ -816,9 +862,16 @@ export default function App() {
                         <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-2xs font-semibold bg-emerald-100 text-emerald-800 border border-emerald-300">
                           <FileCheck className="w-3 h-3" /> Teks Termuat
                         </span>
+                        <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                          uploadedPdf.fileType === 'docx' || uploadedPdf.fileType === 'doc'
+                            ? 'bg-blue-100 text-blue-800 border border-blue-300'
+                            : 'bg-red-100 text-red-800 border border-red-300'
+                        }`}>
+                          {uploadedPdf.fileType === 'docx' ? 'Microsoft Word (.docx)' : uploadedPdf.fileType === 'doc' ? 'Microsoft Word (.doc)' : 'Adobe PDF'}
+                        </span>
                       </div>
                       <div className="flex items-center gap-2.5 text-xs text-slate-500 mt-0.5">
-                        <span>{uploadedPdf.numPages} Halaman</span>
+                        <span>{uploadedPdf.numPages} Halaman {uploadedPdf.fileType !== 'pdf' ? '(est.)' : ''}</span>
                         <span>•</span>
                         <span>{uploadedPdf.wordCount} Kata Argumentasi</span>
                         <span>•</span>
@@ -832,7 +885,7 @@ export default function App() {
                       onClick={() => handleAnalyze()}
                       disabled={isAnalyzing}
                       className="px-3.5 py-1.5 bg-primary hover:bg-blue-700 text-white rounded-md text-xs font-semibold flex items-center gap-1.5 shadow-xs transition-colors disabled:opacity-50 cursor-pointer"
-                      title="Langsung nilai teks dari berkas PDF ini"
+                      title="Langsung nilai teks dari berkas ini"
                     >
                       {isAnalyzing ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Sparkles className="w-3.5 h-3.5 text-amber-300" />}
                       <span>Nilai Dokumen Ini</span>
@@ -840,14 +893,14 @@ export default function App() {
                     <button
                       onClick={() => fileInputRef.current?.click()}
                       className="px-2.5 py-1.5 bg-white hover:bg-slate-100 text-slate-700 border border-slate-200 rounded-md text-xs font-medium transition-colors cursor-pointer"
-                      title="Ganti dokumen PDF"
+                      title="Ganti dokumen PDF atau Word"
                     >
                       Ganti
                     </button>
                     <button
                       onClick={handleRemovePdf}
                       className="p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-md transition-colors cursor-pointer"
-                      title="Lepas dokumen PDF dari sesi editor"
+                      title="Lepas dokumen dari sesi editor"
                     >
                       <Trash2 className="w-4 h-4" />
                     </button>
@@ -860,16 +913,22 @@ export default function App() {
             {!uploadedPdf && !isExtractingPdf && text.trim() === '' && (
               <div 
                 onClick={() => fileInputRef.current?.click()}
-                className="mb-3 p-4 border-2 border-dashed border-blue-200 hover:border-primary bg-blue-50/40 hover:bg-blue-50/70 rounded-lg cursor-pointer transition-all text-center flex flex-col items-center justify-center gap-1.5 group"
+                className="mb-3 p-4 border-2 border-dashed border-blue-200 hover:border-primary bg-blue-50/40 hover:bg-blue-50/70 rounded-lg cursor-pointer transition-all text-center flex flex-col items-center justify-center gap-2 group"
               >
-                <div className="p-2.5 rounded-full bg-blue-100 text-primary group-hover:scale-105 transition-transform">
-                  <FileUp className="w-5 h-5" />
+                <div className="flex items-center gap-2">
+                  <div className="p-2 rounded-full bg-blue-100 text-primary group-hover:scale-105 transition-transform">
+                    <FileUp className="w-5 h-5" />
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <span className="px-2 py-0.5 rounded text-xs font-bold bg-red-100 text-red-700 border border-red-200">PDF</span>
+                    <span className="px-2 py-0.5 rounded text-xs font-bold bg-blue-100 text-blue-700 border border-blue-200">Word DOCX / DOC</span>
+                  </div>
                 </div>
                 <p className="text-sm font-semibold text-slate-700">
-                  Punya berkas PDF berisi teks argumentatif? <span className="text-primary underline underline-offset-2">Klik untuk mengunggah</span> atau seret file PDF ke sini
+                  Punya berkas <span className="text-red-600 font-bold">PDF</span> atau <span className="text-blue-600 font-bold">Word</span> berisi teks argumentatif? <span className="text-primary underline underline-offset-2">Klik untuk mengunggah</span> atau seret berkas ke sini
                 </p>
                 <p className="text-xs text-slate-500">
-                  Mendukung dokumen PDF esai, artikel opini, tugas kuliah, atau karya ilmiah untuk dinilai (maks. 25MB)
+                  Mendukung dokumen PDF (.pdf), Microsoft Word (.docx, .doc), esai, artikel opini, tugas kuliah, atau karya ilmiah untuk dinilai (maks. 25MB)
                 </p>
               </div>
             )}
@@ -877,7 +936,7 @@ export default function App() {
             {/* Textarea Editor */}
             <textarea
               className="flex-1 w-full p-4 border border-border rounded-md text-base leading-relaxed focus:outline-none focus:ring-2 focus:ring-primary/50 resize-none transition-all min-h-[220px]"
-              placeholder="Tulis teks argumentatif Anda di sini, atau unggah dokumen PDF di atas untuk mengekstrak dan menilai teks secara langsung..."
+              placeholder="Tulis teks argumentatif Anda di sini, atau unggah dokumen PDF / Word (.docx / .doc) di atas untuk mengekstrak dan menilai teks secara langsung..."
               value={text}
               onChange={(e) => setText(e.target.value)}
             />
@@ -890,8 +949,11 @@ export default function App() {
                 </span>
                 {uploadedPdf && (
                   <span className="text-xs text-slate-500 hidden sm:inline flex items-center gap-1">
-                    <FileText className="w-3.5 h-3.5 text-red-500 inline shrink-0" />
+                    <FileText className={`w-3.5 h-3.5 inline shrink-0 ${
+                      uploadedPdf.fileType === 'docx' || uploadedPdf.fileType === 'doc' ? 'text-blue-600' : 'text-red-500'
+                    }`} />
                     Sumber: <strong className="text-slate-700 truncate max-w-[200px] inline-block align-bottom">{uploadedPdf.filename}</strong>
+                    <span className="text-[10px] uppercase font-bold text-slate-500">({uploadedPdf.fileType})</span>
                   </span>
                 )}
               </div>
@@ -901,10 +963,10 @@ export default function App() {
                   type="button"
                   onClick={() => fileInputRef.current?.click()}
                   className="bg-slate-100 hover:bg-slate-200 text-text-main px-3 py-2 rounded-md font-medium text-xs sm:text-sm transition-colors flex items-center gap-1.5 border border-slate-200 cursor-pointer"
-                  title="Unggah berkas PDF argumentatif"
+                  title="Unggah berkas PDF atau Word argumentatif"
                 >
                   <Upload className="w-3.5 h-3.5 text-slate-600" />
-                  <span>Unggah PDF</span>
+                  <span>Unggah PDF / Word</span>
                 </button>
                 <button
                   type="button"
@@ -970,18 +1032,24 @@ export default function App() {
             )}
           </section>
 
-          {/* PDF Replace / Append Conflict Modal */}
+          {/* Document Replace / Append Conflict Modal */}
           {showPdfReplaceModal && pendingPdf && (
             <div className="fixed inset-0 z-50 bg-black/40 backdrop-blur-xs flex items-center justify-center p-4">
               <div className="bg-white rounded-xl shadow-2xl border border-slate-200 max-w-md w-full p-5 space-y-4 animate-scaleUp">
                 <div className="flex items-start gap-3">
-                  <div className="p-2.5 rounded-lg bg-blue-100 text-primary shrink-0">
+                  <div className={`p-2.5 rounded-lg shrink-0 ${
+                    pendingPdf.fileType === 'docx' || pendingPdf.fileType === 'doc'
+                      ? 'bg-blue-600 text-white'
+                      : 'bg-red-100 text-red-600'
+                  }`}>
                     <FileText className="w-6 h-6" />
                   </div>
                   <div>
-                    <h3 className="text-base font-bold text-slate-900">Muat Teks dari Dokumen PDF</h3>
+                    <h3 className="text-base font-bold text-slate-900">
+                      Muat Teks dari Dokumen {pendingPdf.fileType === 'docx' ? 'Word (.docx)' : pendingPdf.fileType === 'doc' ? 'Word (.doc)' : 'PDF'}
+                    </h3>
                     <p className="text-xs text-slate-500 mt-0.5">
-                      Berkas <strong>{pendingPdf.filename}</strong> ({pendingPdf.wordCount} kata, {pendingPdf.numPages} halaman) berhasil diekstrak.
+                      Berkas <strong>{pendingPdf.filename}</strong> ({pendingPdf.wordCount} kata, {pendingPdf.numPages} halaman {pendingPdf.fileType !== 'pdf' ? 'est.' : ''}) berhasil diekstrak.
                     </p>
                   </div>
                 </div>

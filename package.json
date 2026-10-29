@@ -4,7 +4,7 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "NODE_ENV=development tsx server.ts",
+    "dev": "tsx server.ts",
     "build": "vite build",
     "start": "node server.ts",
     "preview": "vite preview",
@@ -19,6 +19,7 @@
     "dotenv": "^17.2.3",
     "express": "^4.21.2",
     "lucide-react": "^0.546.0",
+    "mammoth": "^1.13.0",
     "motion": "^12.23.24",
     "pdf-parse": "^2.4.5",
     "react": "^19.0.0",

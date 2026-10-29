@@ -77,40 +77,122 @@ async function startServer() {
     });
   });
 
-  // API Routes
-  app.post("/api/extract-pdf", async (req, res) => {
-    try {
-      const { base64, filename } = req.body;
-      if (!base64) {
-        return res.status(400).json({ error: "Data file PDF tidak ditemukan." });
+  // Helper for binary .doc files (Word 97-2003)
+  function extractTextFromDocBinary(buffer: Buffer): string {
+    const utf16Chunks: string[] = [];
+    let currentChunk = "";
+    for (let i = 0; i < buffer.length - 1; i += 2) {
+      const code = buffer.readUInt16LE(i);
+      if ((code >= 32 && code <= 126) || code === 10 || code === 13 || (code >= 160 && code <= 1000)) {
+        currentChunk += String.fromCharCode(code);
+      } else {
+        if (currentChunk.trim().length >= 10) {
+          utf16Chunks.push(currentChunk.trim());
+        }
+        currentChunk = "";
+      }
+    }
+    if (currentChunk.trim().length >= 10) {
+      utf16Chunks.push(currentChunk.trim());
+    }
+
+    const latin1 = buffer.toString("latin1");
+    const runs = latin1.match(/[\w\s.,;:!?"'()\-–—]{12,}/g) || [];
+    const latinClean = runs
+      .map(r => r.trim())
+      .filter(r => r.length > 15 && !r.includes("\x00") && !/^[0-9\s]+$/.test(r) && !r.startsWith("Microsoft"));
+
+    const combined = [...utf16Chunks, ...latinClean];
+    const filtered = combined.filter((chunk, idx, arr) => {
+      if (chunk.length < 10) return false;
+      if (chunk.includes("Normal.dotm") || chunk.includes("Root Entry") || chunk.includes("WordDocument") || chunk.includes("CompObj")) return false;
+      return arr.indexOf(chunk) === idx;
+    });
+
+    return filtered.join("\n\n").trim();
+  }
+
+  // Unified document extraction logic for PDF, DOCX, and DOC
+  async function extractDocumentData(base64: string, filename: string = "dokumen") {
+    let cleanBase64 = base64;
+    if (cleanBase64.includes(",")) {
+      cleanBase64 = cleanBase64.split(",")[1];
+    }
+
+    const buffer = Buffer.from(cleanBase64, "base64");
+    const lowerFilename = filename.toLowerCase();
+
+    // Determine document type
+    let fileType: "pdf" | "docx" | "doc" = "pdf";
+    if (lowerFilename.endsWith(".docx")) {
+      fileType = "docx";
+    } else if (lowerFilename.endsWith(".doc")) {
+      fileType = "doc";
+    } else if (lowerFilename.endsWith(".pdf")) {
+      fileType = "pdf";
+    } else {
+      // Check magic numbers
+      if (buffer.length >= 4) {
+        if (buffer[0] === 0x25 && buffer[1] === 0x50 && buffer[2] === 0x44 && buffer[3] === 0x46) {
+          fileType = "pdf";
+        } else if (buffer[0] === 0x50 && buffer[1] === 0x4B && buffer[2] === 0x03 && buffer[3] === 0x04) {
+          fileType = "docx";
+        } else if (buffer[0] === 0xD0 && buffer[1] === 0xCF && buffer[2] === 0x11 && buffer[3] === 0xE0) {
+          fileType = "doc";
+        }
+      }
+    }
+
+    let extractedText = "";
+    let numPages = 1;
+    let method: string = fileType;
+
+    if (fileType === "docx" || fileType === "doc") {
+      // 1. Try mammoth for Word documents (both .docx and OpenXML .doc)
+      try {
+        const mammothModule = await import("mammoth");
+        const mammoth = (mammothModule as any).default || mammothModule;
+        const result = await mammoth.extractRawText({ buffer });
+        extractedText = (result.value || "").trim();
+        method = "mammoth-docx";
+      } catch (docErr: any) {
+        console.warn("Mammoth extraction warning:", docErr?.message || docErr);
       }
 
-      let cleanBase64 = base64;
-      if (cleanBase64.includes(",")) {
-        cleanBase64 = cleanBase64.split(",")[1];
+      // 2. If mammoth failed and it's a binary .doc, use binary stream extraction
+      if ((!extractedText || extractedText.length < 20) && fileType === "doc") {
+        try {
+          const binText = extractTextFromDocBinary(buffer);
+          if (binText && binText.length > extractedText.length) {
+            extractedText = binText;
+            method = "binary-doc-stream";
+          }
+        } catch (binErr: any) {
+          console.warn("Binary doc extraction error:", binErr?.message || binErr);
+        }
       }
 
-      const pdfBuffer = Buffer.from(cleanBase64, "base64");
-      let extractedText = "";
-      let numPages = 1;
-      let method = "pdf-parse";
+      // Estimate pages for Word documents (~300 words/page)
+      const words = extractedText.split(/\s+/).filter(Boolean).length;
+      numPages = Math.max(1, Math.ceil(words / 300));
 
-      // 1. Try local PDF extraction via pdf-parse
+    } else {
+      // PDF Extraction
       try {
         const { PDFParse } = await import("pdf-parse");
-        const parser = new PDFParse({ data: pdfBuffer });
+        const parser = new PDFParse({ data: buffer });
         const result = await parser.getText();
         let raw = (result.text || "").trim();
-        // Remove pdf-parse page marker tags like "-- 1 of 2 --"
         raw = raw.replace(/--\s*\d+\s+of\s+\d+\s*--/g, "").trim();
         extractedText = raw;
         numPages = result.total || 1;
         await parser.destroy().catch(() => {});
+        method = "pdf-parse";
       } catch (parseErr: any) {
         console.warn("Local PDF parsing warning:", parseErr?.message || parseErr);
       }
 
-      // 2. If text is too short or empty (e.g. scanned image PDF), fallback to Gemini Multimodal
+      // Fallback for scanned/empty PDF
       if (extractedText.length < 40) {
         const apiKey = getGeminiApiKey();
         if (apiKey) {
@@ -118,12 +200,9 @@ async function startServer() {
             const ai = new GoogleGenAI({
               apiKey,
               httpOptions: {
-                headers: {
-                  'User-Agent': 'aistudio-build',
-                }
+                headers: { 'User-Agent': 'aistudio-build' }
               }
             });
-
             const prompt = "Ekstrak seluruh teks argumentatif yang tertulis di dalam dokumen PDF ini. Pertahankan susunan paragraf dan kalimat secara utuh tanpa merangkum atau menambahkan opini pembuka/penutup. Jika dokumen benar-benar kosong atau tidak memuat teks tulisan apa pun, jawab HANYA dengan kata: KOSONG";
             const response = await generateContentWithRetry(ai, {
               contents: [
@@ -136,11 +215,8 @@ async function startServer() {
                 prompt
               ]
             });
-
             const geminiText = (response.text || "").trim();
-            if (geminiText.toUpperCase() === "KOSONG" || (geminiText.toLowerCase().includes("kosong") && geminiText.length < 50)) {
-              // Document is truly empty
-            } else if (geminiText.length > extractedText.length) {
+            if (geminiText.toUpperCase() !== "KOSONG" && geminiText.length > extractedText.length) {
               extractedText = geminiText;
               method = "gemini-multimodal";
             }
@@ -149,26 +225,52 @@ async function startServer() {
           }
         }
       }
+    }
 
-      if (!extractedText || extractedText.length < 10) {
-        return res.status(422).json({
-          error: "Tidak dapat membaca teks tulisan dari dokumen PDF ini. Pastikan berkas PDF memuat teks yang dapat dibaca atau silakan salin-tempel teks secara langsung ke editor."
-        });
+    if (!extractedText || extractedText.length < 10) {
+      const formatLabel = fileType === "pdf" ? "PDF" : (fileType === "docx" ? "Word (.docx)" : "Word (.doc)");
+      throw new Error(`Tidak dapat membaca teks tulisan dari dokumen ${formatLabel} ini. Pastikan berkas memuat teks yang dapat dibaca atau silakan salin-tempel teks secara langsung ke editor.`);
+    }
+
+    const wordCount = extractedText.trim().split(/\s+/).filter(Boolean).length;
+
+    return {
+      text: extractedText,
+      numPages,
+      filename: filename || `dokumen.${fileType}`,
+      fileType,
+      wordCount,
+      method
+    };
+  }
+
+  // Unified extract endpoint for PDF & Word
+  app.post("/api/extract-document", async (req, res) => {
+    try {
+      const { base64, filename } = req.body;
+      if (!base64) {
+        return res.status(400).json({ error: "Data berkas dokumen tidak ditemukan." });
       }
-
-      // Calculate word count
-      const wordCount = extractedText.trim().split(/\s+/).filter(Boolean).length;
-
-      res.json({
-        text: extractedText,
-        numPages,
-        filename: filename || "dokumen.pdf",
-        wordCount,
-        method
-      });
+      const result = await extractDocumentData(base64, filename);
+      res.json(result);
     } catch (error: any) {
-      console.error("PDF extraction endpoint error:", error);
-      res.status(500).json({ error: "Gagal memproses file PDF: " + (error?.message || "Kesalahan server.") });
+      console.error("Document extraction error:", error);
+      res.status(422).json({ error: error.message || "Gagal memproses berkas dokumen." });
+    }
+  });
+
+  // Legacy route backwards compatibility
+  app.post("/api/extract-pdf", async (req, res) => {
+    try {
+      const { base64, filename } = req.body;
+      if (!base64) {
+        return res.status(400).json({ error: "Data file PDF/dokumen tidak ditemukan." });
+      }
+      const result = await extractDocumentData(base64, filename);
+      res.json(result);
+    } catch (error: any) {
+      console.error("PDF/doc extraction endpoint error:", error);
+      res.status(422).json({ error: error.message || "Gagal memproses file dokumen." });
     }
   });
 
@@ -376,7 +478,7 @@ async function startServer() {
   });
 
   // Serve static assets in production, or Vite dev server in development
-  const isDev = process.env.NODE_ENV === "development";
+  const isDev = process.env.NODE_ENV !== "production" && process.env.npm_lifecycle_event !== "start";
   const distPath = path.join(process.cwd(), 'dist');
   const distExists = fs.existsSync(path.join(distPath, 'index.html'));
 
