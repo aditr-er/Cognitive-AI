@@ -7,6 +7,7 @@ import {
   HelpCircle, ArrowRight, Upload, FileUp, FileCheck, Trash2, Award, GraduationCap, 
   Calculator, Sliders
 } from 'lucide-react';
+import { extractDocumentClientSide } from './utils/documentExtractor';
 
 // Types
 export type WeightRatio = '50-50' | '60-40' | '40-60' | '100-logic' | '100-halliday';
@@ -232,39 +233,6 @@ export default function App() {
     }
   };
 
-  // Client-side text stream fallback in case server extraction fails
-  const extractTextFromPdfClientFallback = async (file: File): Promise<string> => {
-    try {
-      const buffer = await file.arrayBuffer();
-      const textDecoder = new TextDecoder('latin1');
-      const content = textDecoder.decode(buffer);
-      
-      const streamRegex = /BT[\s\S]*?ET/g;
-      const matches = content.match(streamRegex);
-      if (!matches || matches.length === 0) return '';
-      
-      const textPieces: string[] = [];
-      for (const block of matches) {
-        const tjRegex = /\(([^)]+)\)\s*(?:Tj|'|")/g;
-        let m;
-        while ((m = tjRegex.exec(block)) !== null) {
-          if (m[1]) textPieces.push(m[1]);
-        }
-        const arrayRegex = /\[([^\]]+)\]\s*TJ/g;
-        while ((m = arrayRegex.exec(block)) !== null) {
-          const innerRegex = /\(([^)]+)\)/g;
-          let im;
-          while ((im = innerRegex.exec(m[1])) !== null) {
-            if (im[1]) textPieces.push(im[1]);
-          }
-        }
-      }
-      return textPieces.join(' ').replace(/\\([()\\])/g, '$1').replace(/\s+/g, ' ').trim();
-    } catch {
-      return '';
-    }
-  };
-
   // Document (PDF & Word DOCX/DOC) Upload Handlers
   const handleDocumentFile = async (file: File, autoAnalyze = autoAnalyzeAfterUpload) => {
     if (!file) return;
@@ -291,25 +259,26 @@ export default function App() {
     setPdfExtractionProgress(`Membaca dokumen ${typeLabel} "${file.name}"...`);
 
     try {
-      const reader = new FileReader();
-      const base64Promise = new Promise<string>((resolve, reject) => {
-        reader.onload = () => {
-          const res = reader.result as string;
-          const base64 = res.includes(',') ? res.split(',')[1] : res;
-          resolve(base64);
-        };
-        reader.onerror = (e) => reject(e);
-      });
-      reader.readAsDataURL(file);
-      const base64 = await base64Promise;
-
-      setPdfExtractionProgress(`Mengekstrak teks argumentasi dari berkas ${typeLabel}...`);
-
       let extractedText = "";
       let numPages = 1;
       let finalFileType = detectedType;
+      let usedMethod = "";
 
+      // Step 1: Try server extraction endpoint
       try {
+        setPdfExtractionProgress(`Mengekstrak teks argumentasi dari berkas ${typeLabel}...`);
+        const reader = new FileReader();
+        const base64Promise = new Promise<string>((resolve, reject) => {
+          reader.onload = () => {
+            const res = reader.result as string;
+            const base64 = res.includes(',') ? res.split(',')[1] : res;
+            resolve(base64);
+          };
+          reader.onerror = (e) => reject(e);
+        });
+        reader.readAsDataURL(file);
+        const base64 = await base64Promise;
+
         const res = await fetch('/api/extract-document', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -319,28 +288,40 @@ export default function App() {
           })
         });
 
-        if (!res.ok) {
-          const errJson = await res.json().catch(() => ({}));
-          throw new Error(errJson.error || `Gagal mengekstrak teks dari server (Status ${res.status}).`);
-        }
-
-        const data = await res.json();
-        extractedText = (data.text || '').trim();
-        numPages = data.numPages || 1;
-        if (data.fileType) finalFileType = data.fileType;
-      } catch (serverErr: any) {
-        console.warn("Server document extraction failed, evaluating fallback:", serverErr);
-        if (isPdf) {
-          const fallbackText = await extractTextFromPdfClientFallback(file);
-          if (fallbackText && fallbackText.length > 20) {
-            extractedText = fallbackText;
-            showToast("Teks PDF berhasil diekstrak via pembaca lokal peramban.", "info");
-          } else {
-            throw serverErr;
+        if (res.ok) {
+          const data = await res.json();
+          if (data && data.text && data.text.trim().length > 10) {
+            extractedText = data.text.trim();
+            numPages = data.numPages || 1;
+            if (data.fileType) finalFileType = data.fileType;
+            usedMethod = "server";
           }
         } else {
-          throw serverErr;
+          console.warn(`Server document extraction returned status ${res.status}. Switching to client-side extractor.`);
         }
+      } catch (serverErr: any) {
+        console.warn("Server extraction network/endpoint error:", serverErr?.message || serverErr);
+      }
+
+      // Step 2: Resilient Client-Side Fallback (runs if server is 404, offline, or returns empty text)
+      if (!extractedText || extractedText.length < 15) {
+        setPdfExtractionProgress(`Memproses teks dokumen langsung di peramban...`);
+        try {
+          const clientData = await extractDocumentClientSide(file);
+          if (clientData && clientData.text && clientData.text.trim().length > 10) {
+            extractedText = clientData.text.trim();
+            numPages = clientData.numPages;
+            finalFileType = clientData.fileType;
+            usedMethod = clientData.method;
+            showToast(`Teks ${typeLabel} berhasil diekstrak via pemroses dokumen peramban.`, "info");
+          }
+        } catch (clientErr: any) {
+          console.warn("Client-side fallback error:", clientErr);
+        }
+      }
+
+      if (!extractedText || extractedText.length < 10) {
+        throw new Error(`Tidak dapat membaca teks tulisan dari dokumen ${typeLabel} ini. Pastikan berkas memuat teks tulisan (bukan gambar scan kosong) atau silakan salin-tempel teks secara langsung ke editor.`);
       }
 
       const sizeKB = Math.round(file.size / 1024);
